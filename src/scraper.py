@@ -37,13 +37,22 @@ class LibraryScraper:
             )
             page = context.new_page()
 
-            # Step 1: Navigate to Login Page
-            logger.info("Navigating to login page...")
-            page.goto(self.config.library_login_url, wait_until="domcontentloaded", timeout=60000)
+            # Step 1: Navigate to Main Site & Login Page
+            logger.info("Navigating to main portal root...")
+            page.goto("https://infocenters.co.il/herzliya/", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1000)
 
-            # Step 2: Fill Auth Credentials
-            id_selectors = ["input[name='id']", "input[name='userid']", "input[name='reader_id']", "input[type='text']"]
-            pass_selectors = ["input[name='pass']", "input[name='password']", "input[type='password']"]
+            logger.info("Navigating to login dialog...")
+            page.goto(self.config.library_login_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_selector("#user_id_0", timeout=20000)
+
+
+
+
+
+            # Step 2: Fill Auth Credentials with keyboard events for IDEA DataWindow
+            id_selectors = ["#user_id_0", "input[name='id']", "input[name='userid']", "input[type='text']"]
+            pass_selectors = ["#password_0", "input[name='pass']", "input[name='password']", "input[type='password']"]
 
             id_input = None
             for sel in id_selectors:
@@ -63,23 +72,33 @@ class LibraryScraper:
                     error_message="Could not locate login ID or password input fields on page.",
                 )
 
-            page.fill(id_input, self.config.library_id_number)
-            page.fill(pass_input, self.config.library_password)
+            # Focus, type with keypress events, and blur to update HTDW state
+            page.click(id_input)
+            page.keyboard.type(self.config.library_id_number, delay=50)
+            page.evaluate(f"document.querySelector('{id_input}').blur()")
 
-            # Step 3: Submit Login Form
-            submit_selectors = ["input[type='submit']", "button[type='submit']", "#submit", "a.button", "button"]
-            submit_btn = None
-            for sel in submit_selectors:
-                if page.is_visible(sel):
-                    submit_btn = sel
-                    break
+            page.click(pass_input)
+            page.keyboard.type(self.config.library_password, delay=50)
+            page.evaluate(f"document.querySelector('{pass_input}').blur()")
 
-            if submit_btn:
-                page.click(submit_btn)
-            else:
-                page.keyboard.press("Enter")
+            # Step 3: Submit Login Form via HTDW handler
+            logger.info("Submitting login form...")
+            try:
+                page.evaluate("htmldw.buttonPress('Update', 0, 'b_login', 0)")
+            except Exception as e:
+                logger.warning(f"JS buttonPress failed ({e}), clicking login button directly...")
+                page.click("#b_login_0")
 
+            page.wait_for_timeout(4000)
+
+            # Solidify session by visiting main portal home page
+            logger.info("Solidifying authenticated session on portal root...")
+            page.goto("https://infocenters.co.il/herzliya/site.asp?site=herzliya", wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2000)
+
+
+
+
 
             # Step 4: Discover all menu links on reader portal
             logger.info("Scanning reader portal navigation links for digital coupons...")
@@ -99,6 +118,7 @@ class LibraryScraper:
                         logger.info(f"Discovered potential coupon menu link: '{text}' -> {full_url}")
 
             # Step 5: Parse Coupons from all discovered pages
+            import re
             extracted_coupons: list[Coupon] = []
             seen_extracted_ids = set()
 
@@ -106,38 +126,40 @@ class LibraryScraper:
                 logger.info(f"Scraping page: {target_url}")
                 try:
                     page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(4000)
                 except Exception as nav_err:
                     logger.warning(f"Could not navigate to {target_url}: {nav_err}")
                     continue
 
-                items = page.query_selector_all("tr, div.coupon, div.item, td, div.code_box, p, span")
-                for item in items:
-                    text = item.inner_text().strip()
-                    if not text or len(text) < 3:
-                        continue
-                    
-                    if any(kw in text for kw in ["קוד", "שובר", "עברית", "קופון", "קוד טעינה"]):
-                        lines = [line.strip() for line in text.splitlines() if line.strip()]
-                        title = lines[0] if lines else "Herzliya Library Digital Coupon"
-                        code = ""
-                        description = " ".join(lines[1:]) if len(lines) > 1 else text
+                # Parse coupon codes directly from page text and table content
+                frames_to_check = page.frames if page.frames else [page.main_frame]
+                for frame in frames_to_check:
+                    try:
+                        frame_html = frame.content()
+                        frame_text = frame.inner_text("body")
 
-                        for line in lines:
-                            if "קוד" in line or (line.isalnum() and len(line) >= 4):
-                                code = line
-                                break
+                        # Match active e-vrit coupon codes (e.g. herABBRZQFEH)
+                        matches = set(re.findall(r"\b(her[A-Za-z0-9]{6,20})\b", frame_html + "\n" + frame_text))
+                        for code_val in matches:
+                            coupon = Coupon(
+                                title=f"e-vrit Digital Coupon ({code_val})",
+                                code=code_val,
+                                description=f"Active Digital Coupon Code: {code_val} | Vendor: e-vrit",
+                                link=target_url,
+                            )
+                            if coupon.item_id not in seen_extracted_ids:
+                                seen_extracted_ids.add(coupon.item_id)
+                                extracted_coupons.append(coupon)
 
-                        coupon = Coupon(
-                            title=title,
-                            code=code if code else "See Portal",
-                            description=description[:250],
-                            link=target_url,
-                        )
-                        
-                        if coupon.item_id not in seen_extracted_ids:
-                            seen_extracted_ids.add(coupon.item_id)
-                            extracted_coupons.append(coupon)
+                    except Exception as frame_err:
+                        logger.warning(f"Could not scan frame {frame.url}: {frame_err}")
+
+
+
+
+
+
+
 
             return IngestionResult(
                 status=IngestionStatus.SUCCESS,
