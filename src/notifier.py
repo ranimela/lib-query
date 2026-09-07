@@ -29,10 +29,13 @@ class Notifier:
         Returns:
             True if HTTP dispatch succeeded, False otherwise.
         """
-        title_text = f"Library Coupon: {coupon.title}"
+        title_text = f"🎁 {coupon.title}"
+        if coupon.code:
+            title_text = f"🎁 {coupon.title} (Code: {coupon.code})"
+
         body_lines = [f"Title: {coupon.title}"]
         if coupon.code:
-            body_lines.append(f"Code: {coupon.code}")
+            body_lines.append(f"Coupon Code: {coupon.code}")
         if coupon.expiration_date:
             body_lines.append(f"Expires: {coupon.expiration_date}")
         if coupon.description:

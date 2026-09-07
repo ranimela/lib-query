@@ -71,7 +71,12 @@ def run_pipeline() -> int:
 
     if not new_coupons:
         logger.info("No new coupons discovered today. Pipeline finished.")
-        notifier.notify_status("Checked Herzliya Library portal — 0 new coupons discovered today.")
+        if result.coupons:
+            codes_str = ", ".join(c.code for c in result.coupons if c.code)
+            msg = f"Checked Herzliya Library portal — {len(result.coupons)} active coupon(s) on account ({codes_str if codes_str else 'no code'}), 0 new."
+        else:
+            msg = "Checked Herzliya Library portal — 0 active coupons found on account."
+        notifier.notify_status(msg)
         return 0
 
 
