@@ -122,16 +122,15 @@ class LibraryScraper:
             extracted_coupons: list[Coupon] = []
             seen_extracted_ids = set()
 
-            for target_url in coupon_urls:
-                logger.info(f"Scraping page: {target_url}")
+            def _parse_page_coupons(p_url: str):
+                logger.info(f"Scraping page: {p_url}")
                 try:
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                    page.goto(p_url, wait_until="domcontentloaded", timeout=60000)
                     page.wait_for_timeout(4000)
                 except Exception as nav_err:
-                    logger.warning(f"Could not navigate to {target_url}: {nav_err}")
-                    continue
+                    logger.warning(f"Could not navigate to {p_url}: {nav_err}")
+                    return
 
-                # Parse coupon codes directly from page text and table content
                 frames_to_check = page.frames if page.frames else [page.main_frame]
                 for frame in frames_to_check:
                     try:
@@ -145,7 +144,7 @@ class LibraryScraper:
                                 title=f"e-vrit Digital Coupon ({code_val})",
                                 code=code_val,
                                 description=f"Active Digital Coupon Code: {code_val} | Vendor: e-vrit",
-                                link=target_url,
+                                link=p_url,
                             )
                             if coupon.item_id not in seen_extracted_ids:
                                 seen_extracted_ids.add(coupon.item_id)
@@ -154,12 +153,40 @@ class LibraryScraper:
                     except Exception as frame_err:
                         logger.warning(f"Could not scan frame {frame.url}: {frame_err}")
 
+            for target_url in coupon_urls:
+                _parse_page_coupons(target_url)
 
+            # Step 6: Auto-allocation trigger if no active coupons currently present
+            if not extracted_coupons:
+                logger.info("No active coupons found on account. Attempting automatic coupon allocation trigger...")
+                for target_url in coupon_urls:
+                    try:
+                        page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                        page.wait_for_timeout(3000)
 
+                        alloc_candidates = page.query_selector_all("a, button, input[type='button'], input[type='submit']")
+                        clicked = False
+                        for cand in alloc_candidates:
+                            txt = cand.inner_text().strip()
+                            val = cand.get_attribute("value") or ""
+                            href = cand.get_attribute("href") or ""
+                            onclick = cand.get_attribute("onclick") or ""
+                            
+                            combined = f"{txt} {val} {href} {onclick}".lower()
+                            if any(kw in combined for kw in ["הקצאה", "הקצאת", "לקבלת קופון", "קבל קופון", "dbook_vendor=evrit", "allocate"]):
+                                logger.info(f"Clicking coupon allocation trigger: '{txt or val}' (href: {href})")
+                                cand.click()
+                                page.wait_for_timeout(5000)
+                                clicked = True
+                                break
 
-
-
-
+                        if clicked:
+                            _parse_page_coupons(target_url)
+                            if extracted_coupons:
+                                logger.info(f"Successfully allocated new coupon: {extracted_coupons[0].code}")
+                                break
+                    except Exception as alloc_err:
+                        logger.warning(f"Error during coupon allocation trigger on {target_url}: {alloc_err}")
 
             return IngestionResult(
                 status=IngestionStatus.SUCCESS,
