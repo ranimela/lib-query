@@ -3,21 +3,11 @@
 import logging
 import re
 import time
-from playwright.sync_api import Route, sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from src.config import Config
 from src.models import Coupon, IngestionResult, IngestionStatus
 
 logger = logging.getLogger("lib-query.scraper")
-
-_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
-
-
-def _block_heavy_assets(route: Route) -> None:
-    """Abort image, media, and font requests to prevent IIS 405 rate-limiting storms."""
-    if route.request.resource_type in _BLOCKED_RESOURCE_TYPES or "google-analytics.com" in route.request.url:
-        route.abort()
-    else:
-        route.continue_()
 
 
 class LibraryScraper:
@@ -29,34 +19,22 @@ class LibraryScraper:
 
     def _execute_attempt(self, p) -> IngestionResult:
         """Execute a single browser scraping session."""
-        browser = p.chromium.launch(
-            headless=self.headless,
-            args=[
-                "--headless=new",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        browser = p.chromium.launch(headless=self.headless)
         try:
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 800},
-            )
-            context.route("**/*", _block_heavy_assets)
-            page = context.new_page()
+            # Use native Playwright browser context (avoiding custom user_agent which triggers WAF HTTP 405)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
 
-            # Step 1: Navigate directly to Login Dialog (skipping image-heavy root page)
+            # Step 1: Navigate to Main Site & Login Page
+            logger.info("Navigating to main portal root...")
+            page.goto("https://infocenters.co.il/herzliya/", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1000)
+
             logger.info("Navigating to login dialog...")
             response = page.goto(self.config.library_login_url, wait_until="domcontentloaded", timeout=60000)
             if response and response.status == 405:
                 return IngestionResult(
                     status=IngestionStatus.ERROR,
-                    error_message="Portal returned HTTP 405 (IIS temporary rate-limit cooldown active).",
+                    error_message="Portal returned HTTP 405.",
                 )
             page.wait_for_selector("#user_id_0", timeout=20000)
 
@@ -101,20 +79,42 @@ class LibraryScraper:
 
             page.wait_for_timeout(4000)
 
-            # Step 4: Parse Coupons from target coupon URL and any discovered reader links
+            # Solidify session by visiting main portal home page
+            logger.info("Solidifying authenticated session on portal root...")
+            page.goto("https://infocenters.co.il/herzliya/site.asp?site=herzliya", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+
+            # Step 4: Discover all menu links on reader portal
+            logger.info("Scanning reader portal navigation links for digital coupons...")
             base_domain = "https://infocenters.co.il/herzliya/"
             coupon_urls = [self.config.library_coupon_url]
+
+            anchors = page.query_selector_all("a[href]")
+            for anchor in anchors:
+                href = anchor.get_attribute("href") or ""
+                text = anchor.inner_text().strip()
+
+                if any(kw in href.lower() or kw in text for kw in ["dbook", "evrit", "coupon", "שובר", "קופון", "הטבה", "ספרים דיגיטליים"]):
+                    if href.startswith("javaScript:") or href.startswith("#") or "e-vrit.co.il" in href:
+                        continue
+                    full_url = href if href.startswith("http") else f"{base_domain}{href.lstrip('/')}"
+                    if full_url not in coupon_urls:
+                        coupon_urls.append(full_url)
+                        logger.info(f"Discovered potential coupon menu link: '{text}' -> {full_url}")
+
+            # Step 5: Parse Coupons from all discovered pages
             extracted_coupons: list[Coupon] = []
             seen_extracted_ids: set[str] = set()
 
-            def _parse_page_coupons(p_url: str) -> None:
-                logger.info(f"Scraping page: {p_url}")
-                try:
-                    page.goto(p_url, wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(4000)
-                except Exception as nav_err:
-                    logger.warning(f"Could not navigate to {p_url}: {nav_err}")
-                    return
+            def _parse_page_coupons(p_url: str, navigate: bool = True) -> None:
+                if navigate:
+                    logger.info(f"Scraping page: {p_url}")
+                    try:
+                        page.goto(p_url, wait_until="domcontentloaded", timeout=60000)
+                        page.wait_for_timeout(4000)
+                    except Exception as nav_err:
+                        logger.warning(f"Could not navigate to {p_url}: {nav_err}")
+                        return
 
                 frames_to_check = page.frames if page.frames else [page.main_frame]
                 for frame in frames_to_check:
@@ -138,26 +138,10 @@ class LibraryScraper:
                     except Exception as frame_err:
                         logger.warning(f"Could not scan frame {frame.url}: {frame_err}")
 
-            # Visit primary coupon page first (also solidifies reader session)
-            _parse_page_coupons(self.config.library_coupon_url)
+            for target_url in coupon_urls:
+                _parse_page_coupons(target_url, navigate=True)
 
-            # Discover any additional coupon-related links on the reader portal
-            anchors = page.query_selector_all("a[href]")
-            for anchor in anchors:
-                href = anchor.get_attribute("href") or ""
-                text = anchor.inner_text().strip()
-                if any(kw in href.lower() or kw in text for kw in ["dbook", "evrit", "coupon", "שובר", "קופון", "הטבה", "ספרים דיגיטליים"]):
-                    if href.startswith("javaScript:") or href.startswith("#") or "e-vrit.co.il" in href:
-                        continue
-                    full_url = href if href.startswith("http") else f"{base_domain}{href.lstrip('/')}"
-                    if full_url not in coupon_urls:
-                        coupon_urls.append(full_url)
-                        logger.info(f"Discovered potential coupon menu link: '{text}' -> {full_url}")
-
-            for extra_url in coupon_urls[1:]:
-                _parse_page_coupons(extra_url)
-
-            # Step 5: Auto-allocation trigger if no active coupons currently present
+            # Step 6: Auto-allocation trigger if no active coupons currently present
             if not extracted_coupons:
                 logger.info("No active coupons found on account. Attempting automatic coupon allocation trigger...")
                 for target_url in coupon_urls:
@@ -165,7 +149,8 @@ class LibraryScraper:
                         page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
                         page.wait_for_timeout(3000)
 
-                        alloc_candidates = page.query_selector_all("a, button, input[type='button'], input[type='submit']")
+                        # Look specifically for the e-vrit code allocation button (e.g. <input value="עברית - הקצאת קוד נוסף" onclick="...dbook_allocation...">)
+                        alloc_candidates = page.query_selector_all("input, button, a")
                         clicked = False
                         for cand in alloc_candidates:
                             txt = cand.inner_text().strip()
@@ -174,15 +159,25 @@ class LibraryScraper:
                             onclick = cand.get_attribute("onclick") or ""
 
                             combined = f"{txt} {val} {href} {onclick}".lower()
-                            if any(kw in combined for kw in ["הקצאה", "הקצאת", "לקבלת קופון", "קבל קופון", "dbook_vendor=evrit", "allocate"]):
-                                logger.info(f"Clicking coupon allocation trigger: '{txt or val}' (href: {href})")
+                            is_alloc_action = any(
+                                kw in combined
+                                for kw in ["dbook_allocation", "הקצאת קוד", "לקבלת קופון", "קבל קופון"]
+                            )
+                            is_evrit = any(kw in combined for kw in ["evrit", "עברית"]) or "icast" not in combined
+
+                            if is_alloc_action and is_evrit:
+                                logger.info(f"Clicking coupon allocation button: '{val or txt}' (onclick: {onclick})")
                                 cand.click()
                                 page.wait_for_timeout(5000)
                                 clicked = True
                                 break
 
                         if clicked:
-                            _parse_page_coupons(target_url)
+                            # First check the resulting page directly after the click
+                            _parse_page_coupons(target_url, navigate=False)
+                            if not extracted_coupons:
+                                # Re-navigate to coupon table page if needed
+                                _parse_page_coupons(target_url, navigate=True)
                             if extracted_coupons:
                                 logger.info(f"Successfully allocated new coupon: {extracted_coupons[0].code}")
                                 break
@@ -223,7 +218,7 @@ class LibraryScraper:
                     logger.warning(last_error)
 
                 if attempt < max_retries:
-                    time.sleep(5)
+                    time.sleep(3)
 
         logger.error(f"All {max_retries} scraper attempts failed. Last error: {last_error}")
         return IngestionResult(
