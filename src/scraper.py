@@ -27,7 +27,7 @@ class LibraryScraper:
             # Step 1: Navigate to Main Site & Login Page
             logger.info("Navigating to main portal root...")
             page.goto("https://infocenters.co.il/herzliya/", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1500)
 
             logger.info("Navigating to login dialog...")
             response = page.goto(self.config.library_login_url, wait_until="domcontentloaded", timeout=60000)
@@ -37,6 +37,13 @@ class LibraryScraper:
                     error_message="Portal returned HTTP 405.",
                 )
             page.wait_for_selector("#user_id_0", timeout=20000)
+
+            # Wait for IDEA DataWindow (window.htmldw) onload initialization to complete
+            page.wait_for_function(
+                "() => typeof window.htmldw !== 'undefined' && window.htmldw !== null && Boolean(window.htmldw.gobs)",
+                timeout=20000,
+            )
+            page.wait_for_timeout(1000)
 
             # Step 2: Fill Auth Credentials with keyboard events for IDEA DataWindow
             id_selectors = ["#user_id_0", "input[name='id']", "input[name='userid']", "input[type='text']"]
@@ -62,12 +69,16 @@ class LibraryScraper:
 
             # Focus, type with keypress events, and blur to update HTDW state
             page.click(id_input)
-            page.keyboard.type(self.config.library_id_number, delay=50)
+            page.evaluate(f"document.querySelector('{id_input}').value = ''")
+            page.keyboard.type(self.config.library_id_number, delay=60)
             page.evaluate(f"document.querySelector('{id_input}').blur()")
+            page.wait_for_timeout(300)
 
             page.click(pass_input)
-            page.keyboard.type(self.config.library_password, delay=50)
+            page.evaluate(f"document.querySelector('{pass_input}').value = ''")
+            page.keyboard.type(self.config.library_password, delay=60)
             page.evaluate(f"document.querySelector('{pass_input}').blur()")
+            page.wait_for_timeout(300)
 
             # Step 3: Submit Login Form via HTDW handler
             logger.info("Submitting login form...")
@@ -77,14 +88,35 @@ class LibraryScraper:
                 logger.warning(f"JS buttonPress failed ({e}), clicking login button directly...")
                 page.click("#b_login_0")
 
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(5000)
 
             # Solidify session by visiting main portal home page
             logger.info("Solidifying authenticated session on portal root...")
             page.goto("https://infocenters.co.il/herzliya/site.asp?site=herzliya", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(2500)
 
-            # Step 4: Discover all menu links on reader portal
+            # Step 4: Navigate to primary coupon page and verify authenticated state
+            logger.info(f"Navigating to reader coupon page: {self.config.library_coupon_url}")
+            page.goto(self.config.library_coupon_url, wait_until="domcontentloaded", timeout=60000)
+
+            # Wait for reader page content to finish populating via DataWindow onload
+            try:
+                page.wait_for_function(
+                    "() => document.body && (document.body.innerText.includes('יציאה') || document.body.innerText.includes('פריטים ברשות הקורא') || document.body.innerText.includes('קודים לשימוש הקורא'))",
+                    timeout=15000,
+                )
+            except PlaywrightTimeoutError:
+                logger.warning("Timed out waiting for authenticated reader markers on coupon page.")
+
+            page.wait_for_timeout(2000)
+            body_text_check = page.inner_text("body")
+            if "יציאה" not in body_text_check and "פריטים ברשות הקורא" not in body_text_check and "קודים לשימוש הקורא" not in body_text_check:
+                return IngestionResult(
+                    status=IngestionStatus.AUTH_FAILED,
+                    error_message="Reader portal did not render authenticated session markers after login.",
+                )
+
+            # Discover only digital-book / coupon pages (excluding logout, search, basket, loans, etc.)
             logger.info("Scanning reader portal navigation links for digital coupons...")
             base_domain = "https://infocenters.co.il/herzliya/"
             coupon_urls = [self.config.library_coupon_url]
@@ -93,14 +125,16 @@ class LibraryScraper:
             for anchor in anchors:
                 href = anchor.get_attribute("href") or ""
                 text = anchor.inner_text().strip()
+                href_lower = href.lower()
 
-                if any(kw in href.lower() or kw in text for kw in ["dbook", "evrit", "coupon", "שובר", "קופון", "הטבה", "ספרים דיגיטליים"]):
-                    if href.startswith("javaScript:") or href.startswith("#") or "e-vrit.co.il" in href:
-                        continue
+                if any(skip in href_lower for skip in ["logout", "search.asp", "basket.asp", "javascript:", "#", "e-vrit.co.il"]):
+                    continue
+
+                if "<num_page>dbook</>" in href_lower or any(kw in text for kw in ["שובר", "קופון", "הטבה", "פריטים דיגיטלים", "הקצאת קופונים"]):
                     full_url = href if href.startswith("http") else f"{base_domain}{href.lstrip('/')}"
                     if full_url not in coupon_urls:
                         coupon_urls.append(full_url)
-                        logger.info(f"Discovered potential coupon menu link: '{text}' -> {full_url}")
+                        logger.info(f"Discovered digital coupon menu link: '{text}' -> {full_url}")
 
             # Step 5: Parse Coupons from all discovered pages
             extracted_coupons: list[Coupon] = []
@@ -110,8 +144,8 @@ class LibraryScraper:
                 if navigate:
                     logger.info(f"Scraping page: {p_url}")
                     try:
-                        page.goto(p_url, wait_until="domcontentloaded", timeout=60000)
-                        page.wait_for_timeout(4000)
+                        page.goto(p_url, wait_until="load", timeout=60000)
+                        page.wait_for_timeout(3000)
                     except Exception as nav_err:
                         logger.warning(f"Could not navigate to {p_url}: {nav_err}")
                         return
@@ -138,7 +172,9 @@ class LibraryScraper:
                     except Exception as frame_err:
                         logger.warning(f"Could not scan frame {frame.url}: {frame_err}")
 
-            for target_url in coupon_urls:
+            # Parse the already-loaded primary coupon page first, then any extra URLs
+            _parse_page_coupons(self.config.library_coupon_url, navigate=False)
+            for target_url in coupon_urls[1:]:
                 _parse_page_coupons(target_url, navigate=True)
 
             # Step 6: Auto-allocation trigger if no active coupons currently present
@@ -146,7 +182,7 @@ class LibraryScraper:
                 logger.info("No active coupons found on account. Attempting automatic coupon allocation trigger...")
                 for target_url in coupon_urls:
                     try:
-                        page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                        page.goto(target_url, wait_until="load", timeout=60000)
                         page.wait_for_timeout(3000)
 
                         # Look specifically for the e-vrit code allocation button (e.g. <input value="עברית - הקצאת קוד נוסף" onclick="...dbook_allocation...">)
@@ -191,7 +227,7 @@ class LibraryScraper:
         finally:
             browser.close()
 
-    def run(self, max_retries: int = 2) -> IngestionResult:
+    def run(self, max_retries: int = 3) -> IngestionResult:
         """Execute login and scrape coupons with retry attempts for network resilience.
 
         Args:
